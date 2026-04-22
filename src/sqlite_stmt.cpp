@@ -16,6 +16,13 @@ const char *lp_column_text(::lp_stmt *s, int idx);
 int         lp_column_bytes(::lp_stmt *s, int idx);
 const unsigned char *lp_column_blob(::lp_stmt *s, int idx);
 void        lp_finalize(::lp_stmt *s);
+int         lp_reset(::lp_stmt *s);
+int         lp_clear_bindings(::lp_stmt *s);
+int         lp_bind_int64(::lp_stmt *s, int idx, int64_t v);
+int         lp_bind_double(::lp_stmt *s, int idx, double v);
+int         lp_bind_null(::lp_stmt *s, int idx);
+int         lp_bind_text(::lp_stmt *s, int idx, const char *text, int len);
+int         lp_bind_blob(::lp_stmt *s, int idx, const unsigned char *data, int len);
 }
 
 #define LP_SQLITE_ROW  100
@@ -149,7 +156,9 @@ void SQLiteStatement::CheckTypeIsFloatOrInteger(sqlite3_value *val, int sqlite_c
 
 void SQLiteStatement::Reset() {
 	if (IsLibSQL()) {
-		// PoC: libsql prep statements are row-buffered and single-shot — no reset needed.
+		if (lp_reset(libsql_stmt) != 0) {
+			throw std::runtime_error("libsql lp_reset failed");
+		}
 		return;
 	}
 	SQLiteUtils::Check(sqlite3_reset(stmt), db);
@@ -157,7 +166,9 @@ void SQLiteStatement::Reset() {
 
 void SQLiteStatement::ClearBindings() {
 	if (IsLibSQL()) {
-		// PoC: no bindings supported yet.
+		if (lp_clear_bindings(libsql_stmt) != 0) {
+			throw std::runtime_error("libsql lp_clear_bindings failed");
+		}
 		return;
 	}
 	SQLiteUtils::Check(sqlite3_clear_bindings(stmt), db);
@@ -212,37 +223,89 @@ sqlite3_value *SQLiteStatement::GetValue(idx_t col) {
 
 template <>
 void SQLiteStatement::Bind(idx_t col, int32_t value) {
+	if (IsLibSQL()) {
+		if (lp_bind_int64(libsql_stmt, int(col + 1), int64_t(value)) != 0) {
+			throw std::runtime_error("libsql lp_bind_int64 failed");
+		}
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_bind_int(stmt, col + 1, value), db);
 }
 
 template <>
 void SQLiteStatement::Bind(idx_t col, int64_t value) {
+	if (IsLibSQL()) {
+		if (lp_bind_int64(libsql_stmt, int(col + 1), value) != 0) {
+			throw std::runtime_error("libsql lp_bind_int64 failed");
+		}
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_bind_int64(stmt, col + 1, value), db);
 }
 
 template <>
 void SQLiteStatement::Bind(idx_t col, double value) {
+	if (IsLibSQL()) {
+		if (lp_bind_double(libsql_stmt, int(col + 1), value) != 0) {
+			throw std::runtime_error("libsql lp_bind_double failed");
+		}
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_bind_double(stmt, col + 1, value), db);
 }
 
 void SQLiteStatement::BindBlob(idx_t col, const string_t &value) {
+	if (IsLibSQL()) {
+		if (lp_bind_blob(libsql_stmt, int(col + 1),
+		                 reinterpret_cast<const unsigned char *>(value.GetDataUnsafe()),
+		                 int(value.GetSize())) != 0) {
+			throw std::runtime_error("libsql lp_bind_blob failed");
+		}
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_bind_blob(stmt, col + 1, value.GetDataUnsafe(), value.GetSize(), nullptr), db);
 }
 
 void SQLiteStatement::BindBlob(idx_t col, const string &value) {
+	if (IsLibSQL()) {
+		if (lp_bind_blob(libsql_stmt, int(col + 1),
+		                 reinterpret_cast<const unsigned char *>(value.c_str()),
+		                 int(value.length())) != 0) {
+			throw std::runtime_error("libsql lp_bind_blob failed");
+		}
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_bind_blob(stmt, col + 1, value.c_str(), value.length(), nullptr), db);
 }
 
 void SQLiteStatement::BindText(idx_t col, const string_t &value) {
+	if (IsLibSQL()) {
+		if (lp_bind_text(libsql_stmt, int(col + 1), value.GetDataUnsafe(), int(value.GetSize())) != 0) {
+			throw std::runtime_error("libsql lp_bind_text failed");
+		}
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_bind_text(stmt, col + 1, value.GetDataUnsafe(), value.GetSize(), nullptr), db);
 }
 
 void SQLiteStatement::BindText(idx_t col, const string &value) {
+	if (IsLibSQL()) {
+		if (lp_bind_text(libsql_stmt, int(col + 1), value.c_str(), int(value.length())) != 0) {
+			throw std::runtime_error("libsql lp_bind_text failed");
+		}
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_bind_text(stmt, col + 1, value.c_str(), value.length(), nullptr), db);
 }
 
 template <>
 void SQLiteStatement::Bind(idx_t col, std::nullptr_t value) {
+	if (IsLibSQL()) {
+		if (lp_bind_null(libsql_stmt, int(col + 1)) != 0) {
+			throw std::runtime_error("libsql lp_bind_null failed");
+		}
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_bind_null(stmt, col + 1), db);
 }
 

@@ -1,5 +1,12 @@
 #include "storage/sqlite_transaction.hpp"
 #include "storage/sqlite_catalog.hpp"
+#include "sqlite_db.hpp"
+
+extern "C" {
+int lp_begin(::lp_handle *h);
+int lp_commit(::lp_handle *h);
+int lp_rollback(::lp_handle *h);
+}
 #include "storage/sqlite_index_entry.hpp"
 #include "storage/sqlite_schema_entry.hpp"
 #include "storage/sqlite_table_entry.hpp"
@@ -70,19 +77,27 @@ SQLiteTransaction::~SQLiteTransaction() {
 
 void SQLiteTransaction::Start() {
 	if (db->IsLibSQL()) {
-		// PoC: each lp_exec opens a fresh Hrana stream, so BEGIN/COMMIT don't straddle.
+		if (lp_begin(db->libsql_handle) != 0) {
+			throw std::runtime_error("libsql lp_begin failed");
+		}
 		return;
 	}
 	db->Execute("BEGIN TRANSACTION");
 }
 void SQLiteTransaction::Commit() {
 	if (db->IsLibSQL()) {
+		if (lp_commit(db->libsql_handle) != 0) {
+			throw std::runtime_error("libsql lp_commit failed");
+		}
 		return;
 	}
 	db->Execute("COMMIT");
 }
 void SQLiteTransaction::Rollback() {
 	if (db->IsLibSQL()) {
+		if (lp_rollback(db->libsql_handle) != 0) {
+			throw std::runtime_error("libsql lp_rollback failed");
+		}
 		return;
 	}
 	db->Execute("ROLLBACK");
