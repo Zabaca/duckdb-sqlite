@@ -71,7 +71,7 @@ static unique_ptr<FunctionData> SQLiteQueryBind(ClientContext &context, TableFun
 
 	auto &con = transaction.GetDB();
 	auto stmt = con.Prepare(sql);
-	if (!stmt.stmt) {
+	if (!stmt.IsOpen()) {
 		throw BinderException("Failed to prepare query \"%s\"", sql);
 	}
 	for (idx_t c = 0; c < stmt.GetColumnCount(); c++) {

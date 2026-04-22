@@ -7,6 +7,32 @@
 #include "sqlite_db.hpp"
 #include "sqlite_stmt.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
+// PoC: libsql-probe Rust C ABI.
+extern "C" {
+::lp_handle *lp_open(const char *url, const char *token);
+void    lp_close(::lp_handle *h);
+int     lp_exec(::lp_handle *h, const char *sql);
+int     lp_query_scalar_i64(::lp_handle *h, const char *sql, int64_t *out);
+struct lp_stmt;
+::lp_stmt *lp_prepare(::lp_handle *h, const char *sql);
+}
+
+static bool IsLibsqlUrl(const std::string &path) {
+	// Route remote schemes to the libsql Rust client.
+	static const char *prefixes[] = {"libsql://", "libsql+http://", "libsql+https://",
+	                                 "http://", "https://", "wss://", "ws://"};
+	for (auto *p : prefixes) {
+		auto n = std::strlen(p);
+		if (path.size() >= n && std::memcmp(path.data(), p, n) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 namespace duckdb {
 
 static bool debug_sqlite_print_queries = false;
@@ -23,15 +49,27 @@ SQLiteDB::~SQLiteDB() {
 
 SQLiteDB::SQLiteDB(SQLiteDB &&other) noexcept {
 	std::swap(db, other.db);
+	std::swap(libsql_handle, other.libsql_handle);
 }
 
 SQLiteDB &SQLiteDB::operator=(SQLiteDB &&other) noexcept {
 	std::swap(db, other.db);
+	std::swap(libsql_handle, other.libsql_handle);
 	return *this;
 }
 
 SQLiteDB SQLiteDB::Open(const string &path, const SQLiteOpenOptions &options, bool is_shared) {
 	SQLiteDB result;
+	// PoC: URL-scheme dispatch to libsql remote client.
+	if (IsLibsqlUrl(path)) {
+		const char *token = std::getenv("LIBSQL_TOKEN");
+		result.libsql_handle = lp_open(path.c_str(), token ? token : "");
+		if (!result.libsql_handle) {
+			throw std::runtime_error("Unable to open libsql database \"" + path +
+			                         "\" (lp_open returned null; check LIBSQL_TOKEN env var)");
+		}
+		return result;
+	}
 	int flags = SQLITE_OPEN_PRIVATECACHE;
 	if (options.access_mode == AccessMode::READ_ONLY) {
 		flags |= SQLITE_OPEN_READONLY;
@@ -67,8 +105,13 @@ SQLiteDB SQLiteDB::Open(const string &path, const SQLiteOpenOptions &options, bo
 
 bool SQLiteDB::TryPrepare(const string &query, SQLiteStatement &stmt) {
 	stmt.db = db;
+	stmt.owner_db = this;
 	if (debug_sqlite_print_queries) {
 		Printer::Print(query + "\n");
+	}
+	if (IsLibSQL()) {
+		stmt.libsql_stmt = lp_prepare(libsql_handle, query.c_str());
+		return stmt.libsql_stmt != nullptr;
 	}
 	auto rc = sqlite3_prepare_v2(db, query.c_str(), -1, &stmt.stmt, nullptr);
 	if (rc != SQLITE_OK) {
@@ -80,7 +123,12 @@ bool SQLiteDB::TryPrepare(const string &query, SQLiteStatement &stmt) {
 SQLiteStatement SQLiteDB::Prepare(const string &query) {
 	SQLiteStatement stmt;
 	if (!TryPrepare(query, stmt)) {
-		string error = "Failed to prepare query \"" + query + "\": " + string(sqlite3_errmsg(db));
+		string error;
+		if (IsLibSQL()) {
+			error = "Failed to prepare libsql query \"" + query + "\"";
+		} else {
+			error = "Failed to prepare query \"" + query + "\": " + string(sqlite3_errmsg(db));
+		}
 		throw std::runtime_error(error);
 	}
 	return stmt;
@@ -90,6 +138,13 @@ void SQLiteDB::Execute(const string &query) {
 	if (debug_sqlite_print_queries) {
 		Printer::Print(query + "\n");
 	}
+	if (IsLibSQL()) {
+		auto rc = lp_exec(libsql_handle, query.c_str());
+		if (rc != 0) {
+			throw std::runtime_error("Failed to execute libsql query \"" + query + "\"");
+		}
+		return;
+	}
 	auto rc = sqlite3_exec(db, query.c_str(), nullptr, nullptr, nullptr);
 	if (rc != SQLITE_OK) {
 		string error = "Failed to execute query \"" + query + "\": " + string(sqlite3_errmsg(db));
@@ -98,11 +153,16 @@ void SQLiteDB::Execute(const string &query) {
 }
 
 bool SQLiteDB::IsOpen() {
-	return db;
+	return db || libsql_handle;
 }
 
 void SQLiteDB::Close() {
 	if (!IsOpen()) {
+		return;
+	}
+	if (libsql_handle) {
+		lp_close(libsql_handle);
+		libsql_handle = nullptr;
 		return;
 	}
 	auto rc = sqlite3_close_v2(db);

@@ -69,12 +69,22 @@ SQLiteTransaction::~SQLiteTransaction() {
 }
 
 void SQLiteTransaction::Start() {
+	if (db->IsLibSQL()) {
+		// PoC: each lp_exec opens a fresh Hrana stream, so BEGIN/COMMIT don't straddle.
+		return;
+	}
 	db->Execute("BEGIN TRANSACTION");
 }
 void SQLiteTransaction::Commit() {
+	if (db->IsLibSQL()) {
+		return;
+	}
 	db->Execute("COMMIT");
 }
 void SQLiteTransaction::Rollback() {
+	if (db->IsLibSQL()) {
+		return;
+	}
 	db->Execute("ROLLBACK");
 }
 

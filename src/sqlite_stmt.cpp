@@ -2,6 +2,25 @@
 #include "sqlite_db.hpp"
 #include "sqlite_scanner.hpp"
 
+#include <cstdint>
+
+// PoC: libsql-probe C ABI subset used for statements.
+extern "C" {
+int         lp_step(::lp_stmt *s);
+int         lp_column_count(::lp_stmt *s);
+const char *lp_column_name(::lp_stmt *s, int idx);
+int         lp_column_type(::lp_stmt *s, int idx);
+int64_t     lp_column_int64(::lp_stmt *s, int idx);
+double      lp_column_double(::lp_stmt *s, int idx);
+const char *lp_column_text(::lp_stmt *s, int idx);
+int         lp_column_bytes(::lp_stmt *s, int idx);
+const unsigned char *lp_column_blob(::lp_stmt *s, int idx);
+void        lp_finalize(::lp_stmt *s);
+}
+
+#define LP_SQLITE_ROW  100
+#define LP_SQLITE_DONE 101
+
 namespace duckdb {
 
 SQLiteStatement::SQLiteStatement() : db(nullptr), stmt(nullptr) {
@@ -18,15 +37,29 @@ SQLiteStatement::~SQLiteStatement() {
 SQLiteStatement::SQLiteStatement(SQLiteStatement &&other) noexcept {
 	std::swap(db, other.db);
 	std::swap(stmt, other.stmt);
+	std::swap(libsql_stmt, other.libsql_stmt);
+	std::swap(owner_db, other.owner_db);
 }
 
 SQLiteStatement &SQLiteStatement::operator=(SQLiteStatement &&other) noexcept {
 	std::swap(db, other.db);
 	std::swap(stmt, other.stmt);
+	std::swap(libsql_stmt, other.libsql_stmt);
+	std::swap(owner_db, other.owner_db);
 	return *this;
 }
 
 int SQLiteStatement::Step() {
+	if (IsLibSQL()) {
+		auto rc = lp_step(libsql_stmt);
+		if (rc == LP_SQLITE_ROW) {
+			return true;
+		}
+		if (rc == LP_SQLITE_DONE) {
+			return false;
+		}
+		throw std::runtime_error("libsql lp_step failed");
+	}
 	D_ASSERT(db);
 	D_ASSERT(stmt);
 	auto rc = sqlite3_step(stmt);
@@ -39,26 +72,43 @@ int SQLiteStatement::Step() {
 	throw std::runtime_error(string(sqlite3_errmsg(db)));
 }
 int SQLiteStatement::GetType(idx_t col) {
+	if (IsLibSQL()) {
+		return lp_column_type(libsql_stmt, int(col));
+	}
 	D_ASSERT(stmt);
 	return sqlite3_column_type(stmt, col);
 }
 
 string SQLiteStatement::GetName(idx_t col) {
+	if (IsLibSQL()) {
+		auto *nm = lp_column_name(libsql_stmt, int(col));
+		return nm ? string(nm) : string();
+	}
 	D_ASSERT(stmt);
 	return sqlite3_column_name(stmt, col);
 }
 
 idx_t SQLiteStatement::GetColumnCount() {
+	if (IsLibSQL()) {
+		return idx_t(lp_column_count(libsql_stmt));
+	}
 	D_ASSERT(stmt);
 	return sqlite3_column_count(stmt);
 }
 
 bool SQLiteStatement::IsOpen() {
-	return stmt;
+	return stmt || libsql_stmt;
 }
 
 void SQLiteStatement::Close() {
 	if (!IsOpen()) {
+		return;
+	}
+	if (libsql_stmt) {
+		lp_finalize(libsql_stmt);
+		libsql_stmt = nullptr;
+		db = nullptr;
+		owner_db = nullptr;
 		return;
 	}
 	sqlite3_finalize(stmt);
@@ -98,15 +148,30 @@ void SQLiteStatement::CheckTypeIsFloatOrInteger(sqlite3_value *val, int sqlite_c
 }
 
 void SQLiteStatement::Reset() {
+	if (IsLibSQL()) {
+		// PoC: libsql prep statements are row-buffered and single-shot — no reset needed.
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_reset(stmt), db);
 }
 
 void SQLiteStatement::ClearBindings() {
+	if (IsLibSQL()) {
+		// PoC: no bindings supported yet.
+		return;
+	}
 	SQLiteUtils::Check(sqlite3_clear_bindings(stmt), db);
 }
 
 template <>
 string SQLiteStatement::GetValue(idx_t col) {
+	if (IsLibSQL()) {
+		auto *ptr = lp_column_text(libsql_stmt, int(col));
+		if (!ptr) {
+			return string();
+		}
+		return string(ptr);
+	}
 	D_ASSERT(stmt);
 	auto ptr = sqlite3_column_text(stmt, col);
 	if (!ptr) {
@@ -117,18 +182,30 @@ string SQLiteStatement::GetValue(idx_t col) {
 
 template <>
 int SQLiteStatement::GetValue(idx_t col) {
+	if (IsLibSQL()) {
+		return int(lp_column_int64(libsql_stmt, int(col)));
+	}
 	D_ASSERT(stmt);
 	return sqlite3_column_int(stmt, col);
 }
 
 template <>
 int64_t SQLiteStatement::GetValue(idx_t col) {
+	if (IsLibSQL()) {
+		return lp_column_int64(libsql_stmt, int(col));
+	}
 	D_ASSERT(stmt);
 	return sqlite3_column_int64(stmt, col);
 }
 
 template <>
 sqlite3_value *SQLiteStatement::GetValue(idx_t col) {
+	// Callers on the libsql path must branch before reaching here — we can't
+	// synthesize a sqlite3_value* from a libsql row. See sqlite_scanner.cpp
+	// hot-loop flavor split.
+	if (IsLibSQL()) {
+		throw InternalException("sqlite3_value* GetValue not supported on libsql statement");
+	}
 	D_ASSERT(stmt);
 	return sqlite3_column_value(stmt, col);
 }

@@ -15,6 +15,16 @@
 #include "duckdb/common/operator/cast_operators.hpp"
 #include <cmath>
 
+// PoC: libsql column accessors for hot-loop fill.
+extern "C" {
+struct lp_stmt;
+int64_t     lp_column_int64(::lp_stmt *s, int idx);
+double      lp_column_double(::lp_stmt *s, int idx);
+const char *lp_column_text(::lp_stmt *s, int idx);
+int         lp_column_bytes(::lp_stmt *s, int idx);
+const unsigned char *lp_column_blob(::lp_stmt *s, int idx);
+}
+
 namespace duckdb {
 
 struct SqliteLocalState : public LocalTableFunctionState {
@@ -125,17 +135,31 @@ static void SqliteInitInternal(ClientContext &context, const SqliteBindData &bin
 		local_state.db = &local_state.owned_db;
 	}
 	string sql = SqliteGetScanSQL(bind_data, local_state.column_ids);
+	// PoC: libsql statements don't support param bindings yet. Inline the
+	// ROWID range before preparing; user params aren't set on table scans.
+	if (local_state.db->IsLibSQL() && bind_data.rows_per_group.IsValid() && bind_data.params.empty()) {
+		auto inlined = StringUtil::Format(" WHERE ROWID BETWEEN %lld AND %lld",
+		                                  (long long)UnsafeNumericCast<int64_t>(rowid_min),
+		                                  (long long)UnsafeNumericCast<int64_t>(rowid_max));
+		auto suffix = string(" WHERE ROWID BETWEEN ? AND ?");
+		auto pos = sql.rfind(suffix);
+		if (pos != string::npos) {
+			sql.replace(pos, suffix.size(), inlined);
+		}
+	}
 	SqlitePrepareStatement(local_state, sql);
 
 	idx_t param_idx = 0;
-	for (; param_idx < bind_data.params.size(); param_idx++) {
-		const Value &param = bind_data.params[param_idx];
-		local_state.stmt.BindParameter(param, param_idx);
-	}
+	if (!local_state.db->IsLibSQL()) {
+		for (; param_idx < bind_data.params.size(); param_idx++) {
+			const Value &param = bind_data.params[param_idx];
+			local_state.stmt.BindParameter(param, param_idx);
+		}
 
-	if (bind_data.rows_per_group.IsValid()) {
-		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_min));
-		local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_max));
+		if (bind_data.rows_per_group.IsValid()) {
+			local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_min));
+			local_state.stmt.Bind<int64_t>(param_idx++, UnsafeNumericCast<int64_t>(rowid_max));
+		}
 	}
 }
 
@@ -272,6 +296,46 @@ static void SqliteScan(ClientContext &context, TableFunctionInput &data, DataChu
 				if (sqlite_column_type == SQLITE_NULL) {
 					auto &mask = FlatVector::Validity(out_vec);
 					mask.Set(out_idx, false);
+					continue;
+				}
+
+				// PoC: libsql remote rows can't produce sqlite3_value*.
+				// Fill via lp_column_* directly. Subset of types only.
+				if (stmt.IsLibSQL()) {
+					auto *ls = stmt.libsql_stmt;
+					switch (out_vec.GetType().id()) {
+					case LogicalTypeId::BIGINT:
+						FlatVector::GetData<int64_t>(out_vec)[out_idx] = lp_column_int64(ls, int(col_idx));
+						break;
+					case LogicalTypeId::INTEGER:
+						FlatVector::GetData<int32_t>(out_vec)[out_idx] = int32_t(lp_column_int64(ls, int(col_idx)));
+						break;
+					case LogicalTypeId::DOUBLE:
+						FlatVector::GetData<double>(out_vec)[out_idx] = lp_column_double(ls, int(col_idx));
+						break;
+					case LogicalTypeId::VARCHAR: {
+						auto *txt = lp_column_text(ls, int(col_idx));
+						auto nbytes = lp_column_bytes(ls, int(col_idx));
+						if (!txt) {
+							auto &mask = FlatVector::Validity(out_vec);
+							mask.Set(out_idx, false);
+						} else {
+							FlatVector::GetData<string_t>(out_vec)[out_idx] =
+							    StringVector::AddString(out_vec, txt, nbytes);
+						}
+						break;
+					}
+					case LogicalTypeId::BLOB: {
+						auto *blob = lp_column_blob(ls, int(col_idx));
+						auto nbytes = lp_column_bytes(ls, int(col_idx));
+						FlatVector::GetData<string_t>(out_vec)[out_idx] =
+						    StringVector::AddStringOrBlob(out_vec, (const char *)blob, nbytes);
+						break;
+					}
+					default:
+						throw NotImplementedException("libsql PoC: unsupported column type \"%s\"",
+						                              out_vec.GetType().ToString());
+					}
 					continue;
 				}
 

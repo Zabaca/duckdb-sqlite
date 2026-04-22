@@ -12,8 +12,14 @@
 
 #include <cstddef>
 
+// PoC: opaque libsql-probe types.
+extern "C" {
+struct lp_stmt;
+}
+
 namespace duckdb {
 struct SqliteBindData;
+class SQLiteDB;
 
 class SQLiteStatement {
 public:
@@ -29,6 +35,14 @@ public:
 
 	sqlite3 *db;
 	sqlite3_stmt *stmt;
+	// PoC: libsql-flavored statement. When non-null, `stmt` stays null.
+	::lp_stmt *libsql_stmt = nullptr;
+	// Back-pointer to the owning DB so per-call dispatch can inherit flavor.
+	SQLiteDB *owner_db = nullptr;
+
+	bool IsLibSQL() const {
+		return libsql_stmt != nullptr;
+	}
 
 public:
 	int Step();

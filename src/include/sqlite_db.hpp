@@ -11,6 +11,11 @@
 #include "sqlite_utils.hpp"
 #include "storage/sqlite_options.hpp"
 
+// PoC: opaque handle for libsql-probe Rust staticlib.
+extern "C" {
+struct lp_handle;
+}
+
 namespace duckdb {
 class SQLiteStatement;
 struct IndexInfo;
@@ -28,6 +33,8 @@ public:
 	SQLiteDB &operator=(SQLiteDB &&) noexcept;
 
 	sqlite3 *db;
+	// PoC: when non-null the DB is a libsql remote handle; `db` stays null.
+	::lp_handle *libsql_handle = nullptr;
 
 public:
 	static SQLiteDB Open(const string &path, const SQLiteOpenOptions &options, bool is_shared = false);
@@ -53,6 +60,10 @@ public:
 
 	bool IsOpen();
 	void Close();
+
+	bool IsLibSQL() const {
+		return libsql_handle != nullptr;
+	}
 };
 
 } // namespace duckdb
