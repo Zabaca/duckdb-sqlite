@@ -2,7 +2,15 @@
 #include "sqlite_db.hpp"
 #include "sqlite_scanner.hpp"
 
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/decimal.hpp"
+#include "duckdb/common/types/hugeint.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/types/uuid.hpp"
+
 #include <cstdint>
+#include <limits>
 
 // PoC: libsql-probe C ABI subset used for statements.
 extern "C" {
@@ -315,12 +323,89 @@ void SQLiteStatement::BindValue(Vector &col, idx_t c, idx_t r) {
 		Bind<std::nullptr_t>(c, nullptr);
 	} else {
 		switch (col.GetType().id()) {
+		case LogicalTypeId::BOOLEAN:
+			Bind<int64_t>(c, FlatVector::GetData<bool>(col)[r] ? int64_t(1) : int64_t(0));
+			break;
+		case LogicalTypeId::TINYINT:
+			Bind<int64_t>(c, int64_t(FlatVector::GetData<int8_t>(col)[r]));
+			break;
+		case LogicalTypeId::SMALLINT:
+			Bind<int64_t>(c, int64_t(FlatVector::GetData<int16_t>(col)[r]));
+			break;
+		case LogicalTypeId::INTEGER:
+			Bind<int64_t>(c, int64_t(FlatVector::GetData<int32_t>(col)[r]));
+			break;
 		case LogicalTypeId::BIGINT:
 			Bind<int64_t>(c, FlatVector::GetData<int64_t>(col)[r]);
+			break;
+		case LogicalTypeId::UTINYINT:
+			Bind<int64_t>(c, int64_t(FlatVector::GetData<uint8_t>(col)[r]));
+			break;
+		case LogicalTypeId::USMALLINT:
+			Bind<int64_t>(c, int64_t(FlatVector::GetData<uint16_t>(col)[r]));
+			break;
+		case LogicalTypeId::UINTEGER:
+			Bind<int64_t>(c, int64_t(FlatVector::GetData<uint32_t>(col)[r]));
+			break;
+		case LogicalTypeId::UBIGINT: {
+			auto v = FlatVector::GetData<uint64_t>(col)[r];
+			if (v > uint64_t(std::numeric_limits<int64_t>::max())) {
+				throw NotImplementedException("UBIGINT value %llu overflows SQLite INTEGER (int64) on libsql bind",
+				                              (unsigned long long)v);
+			}
+			Bind<int64_t>(c, int64_t(v));
+			break;
+		}
+		case LogicalTypeId::HUGEINT:
+			BindText(c, Hugeint::ToString(FlatVector::GetData<hugeint_t>(col)[r]));
+			break;
+		case LogicalTypeId::FLOAT:
+			Bind<double>(c, double(FlatVector::GetData<float>(col)[r]));
 			break;
 		case LogicalTypeId::DOUBLE:
 			Bind<double>(c, FlatVector::GetData<double>(col)[r]);
 			break;
+		case LogicalTypeId::UUID:
+			// DuckDB UUID physical type is hugeint_t.
+			BindText(c, UUID::ToString(FlatVector::GetData<hugeint_t>(col)[r]));
+			break;
+		case LogicalTypeId::DATE:
+			BindText(c, Date::ToString(FlatVector::GetData<date_t>(col)[r]));
+			break;
+		case LogicalTypeId::TIME:
+		case LogicalTypeId::TIME_TZ:
+			BindText(c, Time::ToString(FlatVector::GetData<dtime_t>(col)[r]));
+			break;
+		case LogicalTypeId::TIMESTAMP:
+		case LogicalTypeId::TIMESTAMP_TZ:
+		case LogicalTypeId::TIMESTAMP_SEC:
+		case LogicalTypeId::TIMESTAMP_MS:
+		case LogicalTypeId::TIMESTAMP_NS:
+			BindText(c, Timestamp::ToString(FlatVector::GetData<timestamp_t>(col)[r]));
+			break;
+		case LogicalTypeId::DECIMAL: {
+			auto width = DecimalType::GetWidth(col.GetType());
+			auto scale = DecimalType::GetScale(col.GetType());
+			string s;
+			switch (col.GetType().InternalType()) {
+			case PhysicalType::INT16:
+				s = Decimal::ToString(FlatVector::GetData<int16_t>(col)[r], width, scale);
+				break;
+			case PhysicalType::INT32:
+				s = Decimal::ToString(FlatVector::GetData<int32_t>(col)[r], width, scale);
+				break;
+			case PhysicalType::INT64:
+				s = Decimal::ToString(FlatVector::GetData<int64_t>(col)[r], width, scale);
+				break;
+			case PhysicalType::INT128:
+				s = Decimal::ToString(FlatVector::GetData<hugeint_t>(col)[r], width, scale);
+				break;
+			default:
+				throw InternalException("Unsupported DECIMAL internal type for SQLite::BindValue");
+			}
+			BindText(c, s);
+			break;
+		}
 		case LogicalTypeId::BLOB:
 			BindBlob(c, FlatVector::GetData<string_t>(col)[r]);
 			break;

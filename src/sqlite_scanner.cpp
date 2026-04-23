@@ -304,6 +304,15 @@ static void SqliteScan(ClientContext &context, TableFunctionInput &data, DataChu
 				if (stmt.IsLibSQL()) {
 					auto *ls = stmt.libsql_stmt;
 					switch (out_vec.GetType().id()) {
+					case LogicalTypeId::BOOLEAN:
+						FlatVector::GetDataMutable<bool>(out_vec)[out_idx] = lp_column_int64(ls, int(col_idx)) != 0;
+						break;
+					case LogicalTypeId::TINYINT:
+						FlatVector::GetDataMutable<int8_t>(out_vec)[out_idx] = int8_t(lp_column_int64(ls, int(col_idx)));
+						break;
+					case LogicalTypeId::SMALLINT:
+						FlatVector::GetDataMutable<int16_t>(out_vec)[out_idx] = int16_t(lp_column_int64(ls, int(col_idx)));
+						break;
 					case LogicalTypeId::BIGINT:
 						FlatVector::GetDataMutable<int64_t>(out_vec)[out_idx] = lp_column_int64(ls, int(col_idx));
 						break;
@@ -313,6 +322,37 @@ static void SqliteScan(ClientContext &context, TableFunctionInput &data, DataChu
 					case LogicalTypeId::DOUBLE:
 						FlatVector::GetDataMutable<double>(out_vec)[out_idx] = lp_column_double(ls, int(col_idx));
 						break;
+					case LogicalTypeId::DATE: {
+						// libsql stores dates as ISO text on our write path.
+						auto *txt = lp_column_text(ls, int(col_idx));
+						auto nbytes = lp_column_bytes(ls, int(col_idx));
+						if (sqlite_column_type == SQLITE_INTEGER) {
+							FlatVector::GetDataMutable<date_t>(out_vec)[out_idx] =
+							    Timestamp::GetDate(Timestamp::FromEpochSeconds(lp_column_int64(ls, int(col_idx))));
+						} else if (!txt) {
+							auto &mask = FlatVector::Validity(out_vec);
+							mask.Set(out_idx, false);
+						} else {
+							FlatVector::GetDataMutable<date_t>(out_vec)[out_idx] = Date::FromCString(txt, nbytes);
+						}
+						break;
+					}
+					case LogicalTypeId::TIMESTAMP:
+					case LogicalTypeId::TIMESTAMP_TZ: {
+						auto *txt = lp_column_text(ls, int(col_idx));
+						auto nbytes = lp_column_bytes(ls, int(col_idx));
+						if (sqlite_column_type == SQLITE_INTEGER) {
+							FlatVector::GetDataMutable<timestamp_t>(out_vec)[out_idx] =
+							    Timestamp::FromEpochSeconds(lp_column_int64(ls, int(col_idx)));
+						} else if (!txt) {
+							auto &mask = FlatVector::Validity(out_vec);
+							mask.Set(out_idx, false);
+						} else {
+							FlatVector::GetDataMutable<timestamp_t>(out_vec)[out_idx] =
+							    Timestamp::FromCString(txt, nbytes);
+						}
+						break;
+					}
 					case LogicalTypeId::VARCHAR: {
 						auto *txt = lp_column_text(ls, int(col_idx));
 						auto nbytes = lp_column_bytes(ls, int(col_idx));
